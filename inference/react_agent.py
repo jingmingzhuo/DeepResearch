@@ -17,9 +17,9 @@ from prompt import *
 import time
 import asyncio
 
-from tool_file import *
+# from tool_file import *
 from tool_scholar import *
-from tool_python import *
+# from tool_python import *
 from tool_search import *
 from tool_visit import *
 
@@ -29,11 +29,11 @@ OBS_END = '\n</tool_response>'
 MAX_LLM_CALL_PER_RUN = int(os.getenv('MAX_LLM_CALL_PER_RUN', 100))
 
 TOOL_CLASS = [
-    FileParser(),
+    # FileParser(),
     Scholar(),
     Visit(),
     Search(),
-    PythonInterpreter(),
+    # PythonInterpreter(),
 ]
 TOOL_MAP = {tool.name: tool for tool in TOOL_CLASS}
 
@@ -52,40 +52,49 @@ class MultiTurnReactAgent(FnCallAgent):
 
         self.llm_generate_cfg = llm["generate_cfg"]
         self.llm_local_path = llm["model"]
+        self.tokenizer_path = os.getenv("TOKENIZER_PATH", self.llm_local_path)
+        self._tokenizer = None
 
     def sanity_check_output(self, content):
         return "<think>" in content and "</think>" in content
     
     def call_server(self, msgs, planning_port, max_tries=10):
-        
-        openai_api_key = "EMPTY"
-        openai_api_base = f"http://127.0.0.1:{planning_port}/v1"
+        main_ports = [
+            port.strip()
+            for port in os.getenv("MAIN_SERVER_PORTS", str(planning_port)).split(",")
+            if port.strip()
+        ]
+        if str(planning_port) in main_ports:
+            main_ports = [str(planning_port)]
 
-        client = OpenAI(
-            api_key=openai_api_key,
-            base_url=openai_api_base,
-            timeout=600.0,
-        )
-
-        base_sleep_time = 1 
         for attempt in range(max_tries):
+            main_port = random.choice(main_ports)
+            openai_api_key = os.getenv('MAIN_API_KEY', 'EMPTY')
+            openai_api_base = os.getenv(
+                'MAIN_API_BASE',
+                f"http://127.0.0.1:{main_port}/v1"
+            )
+    
+            client = OpenAI(
+                api_key=openai_api_key,
+                base_url=openai_api_base,
+                timeout=1000.0,
+            )
+
+            base_sleep_time = 1 
+    
             try:
-                print(f"--- Attempting to call the service, try {attempt + 1}/{max_tries} ---")
+                print(f"--- Attempting to call local vLLM service {openai_api_base}, try {attempt + 1}/{max_tries} ---")
                 chat_response = client.chat.completions.create(
                     model=self.model,
                     messages=msgs,
                     stop=["\n<tool_response>", "<tool_response>"],
                     temperature=self.llm_generate_cfg.get('temperature', 0.6),
                     top_p=self.llm_generate_cfg.get('top_p', 0.95),
-                    logprobs=True,
                     max_tokens=10000,
                     presence_penalty=self.llm_generate_cfg.get('presence_penalty', 1.1)
                 )
                 content = chat_response.choices[0].message.content
-
-                # OpenRouter provides API calling. If you want to use OpenRouter, you need to uncomment line 89 - 90.
-                # reasoning_content = "<think>\n" + chat_response.choices[0].message.reasoning.strip() + "\n</think>"
-                # content = reasoning_content + content                
                 
                 if content and content.strip():
                     print("--- Service call successful, received a valid response ---")
@@ -110,12 +119,17 @@ class MultiTurnReactAgent(FnCallAgent):
         return f"vllm server error!!!"
 
     def count_tokens(self, messages):
-        tokenizer = AutoTokenizer.from_pretrained(self.llm_local_path) 
-        full_prompt = tokenizer.apply_chat_template(messages, tokenize=False)
-        tokens = tokenizer(full_prompt, return_tensors="pt")
-        token_count = len(tokens["input_ids"][0])
-        
-        return token_count
+        try:
+            if self._tokenizer is None:
+                self._tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_path)
+            full_prompt = self._tokenizer.apply_chat_template(messages, tokenize=False)
+            tokens = self._tokenizer(full_prompt, return_tensors="pt")
+            token_count = len(tokens["input_ids"][0])
+            return token_count
+        except Exception as e:
+            print(f"Warning: tokenizer load/count failed ({e}); falling back to approximate length.")
+            fallback_prompt = "\n".join([m.get("role", "") + ":" + m.get("content", "") for m in messages])
+            return len(fallback_prompt) // 4
 
     def _run(self, data: str, model: str, **kwargs) -> List[List[Message]]:
         self.model=model
@@ -127,7 +141,6 @@ class MultiTurnReactAgent(FnCallAgent):
 
         start_time = time.time()
         planning_port = data['planning_port']
-        answer = data['item']['answer']
         self.user_prompt = question
         system_prompt = SYSTEM_PROMPT
         cur_date = today_date()
@@ -135,6 +148,7 @@ class MultiTurnReactAgent(FnCallAgent):
         messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": question}]
         num_llm_calls_available = MAX_LLM_CALL_PER_RUN
         round = 0
+        answer_text = ""
         while num_llm_calls_available > 0:
             # Check whether time is reached
             if time.time() - start_time > 150 * 60:  # 150 minutes in seconds
@@ -142,7 +156,6 @@ class MultiTurnReactAgent(FnCallAgent):
                 termination = 'No answer found after 2h30mins'
                 result = {
                     "question": question,
-                    "answer": answer,
                     "messages": messages,
                     "prediction": prediction,
                     "termination": termination
@@ -178,6 +191,10 @@ class MultiTurnReactAgent(FnCallAgent):
                 # print(result)
                 messages.append({"role": "user", "content": result})
             if '<answer>' in content and '</answer>' in content:
+                try:
+                    answer_text = content.split('<answer>')[1].split('</answer>')[0]
+                except Exception:
+                    answer_text = ""
                 termination = 'answer'
                 break
             if num_llm_calls_available <= 0 and '<answer>' not in content:
@@ -194,14 +211,19 @@ class MultiTurnReactAgent(FnCallAgent):
                 content = self.call_server(messages, planning_port)
                 messages.append({"role": "assistant", "content": content.strip()})
                 if '<answer>' in content and '</answer>' in content:
-                    prediction = messages[-1]['content'].split('<answer>')[1].split('</answer>')[0]
+                    try:
+                        answer_text = messages[-1]['content'].split('<answer>')[1].split('</answer>')[0]
+                    except Exception:
+                        answer_text = ""
+                    prediction = answer_text
                     termination = 'generate an answer as token limit reached'
                 else:
                     prediction = messages[-1]['content']
                     termination = 'format error: generate an answer as token limit reached'
                 result = {
                     "question": question,
-                    "answer": answer,
+                    "answer": answer_text,
+                    "example_id": data['id'],
                     "messages": messages,
                     "prediction": prediction,
                     "termination": termination
@@ -209,7 +231,11 @@ class MultiTurnReactAgent(FnCallAgent):
                 return result
 
         if '<answer>' in messages[-1]['content']:
-            prediction = messages[-1]['content'].split('<answer>')[1].split('</answer>')[0]
+            try:
+                answer_text = messages[-1]['content'].split('<answer>')[1].split('</answer>')[0]
+            except Exception:
+                answer_text = ""
+            prediction = answer_text
             termination = 'answer'
         else:
             prediction = 'No answer found.'
@@ -218,7 +244,7 @@ class MultiTurnReactAgent(FnCallAgent):
                 termination = 'exceed available llm calls'
         result = {
             "question": question,
-            "answer": answer,
+            "answer": answer_text,
             "messages": messages,
             "prediction": prediction,
             "termination": termination

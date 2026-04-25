@@ -98,14 +98,27 @@ class Visit(BaseTool):
         
     def call_server(self, msgs, max_retries=2):
         api_key = os.environ.get("API_KEY")
-        url_llm = os.environ.get("API_BASE")
+        summary_api_bases = os.environ.get("SUMMARY_API_BASES", "")
+        if summary_api_bases:
+            base_urls = [
+                base_url.strip()
+                for base_url in summary_api_bases.split(",")
+                if base_url.strip()
+            ]
+        else:
+            summary_ports = [
+                port.strip()
+                for port in os.environ.get("SUMMARY_SERVER_PORTS", "7001,7002").split(",")
+                if port.strip()
+            ]
+            base_urls = [f"http://127.0.0.1:{port}/v1" for port in summary_ports]
         model_name = os.environ.get("SUMMARY_MODEL_NAME", "")
-        client = OpenAI(
-            api_key=api_key,
-            base_url=url_llm,
-        )
         for attempt in range(max_retries):
             try:
+                client = OpenAI(
+                    api_key=api_key,
+                    base_url=random.choice(base_urls),
+                )
                 chat_response = client.chat.completions.create(
                     model=model_name,
                     messages=msgs,
@@ -157,6 +170,7 @@ class Visit(BaseTool):
                     webpage_content = response.text
                     return webpage_content
                 else:
+                    print("JINA ERROR")
                     print(response.text)
                     raise ValueError("jina readpage error")
             except Exception as e:
